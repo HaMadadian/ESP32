@@ -34,10 +34,12 @@ float velocity = 0.0f;
 unsigned long last_update = 0;
 double lat = 0.0, lon = 0.0;
 uint32_t satellites = 0;
+unsigned long last_log_ms = 0;  // For 1-second logging interval
 
 // ────────────────────────────────────────────────
 // Timestamped Logging
 // ────────────────────────────────────────────────
+// Debug log (serial only, or serial + file if needed)
 void log_info(const char* format, ...) {
     char msg[128];
     va_list args;
@@ -48,34 +50,30 @@ void log_info(const char* format, ...) {
     unsigned long ms = millis();
     Serial.printf("[%07lu.%03lu] INFO: %s\n", ms/1000, ms%1000, msg);
 
-    if (logFile) {
-        logFile.printf("[%07lu.%03lu] INFO: %s\n", ms/1000, ms%1000, msg);
-    }
+    // Optional: echo debug to current log file (comment out if you don't want this)
+    // if (logFile) logFile.printf("[%07lu.%03lu] INFO: %s\n", ms/1000, ms%1000, msg);
+}
+
+// Clean CSV-only log (no debug prefix)
+void log_csv(unsigned long ms, double lat, double lon, uint32_t sats,
+             float ax, float ay, float az, float gx, float gy, float gz,
+             float temp, float vel) {
+    if (!logFile) return;
+
+    char line[256];
+    snprintf(line, sizeof(line),
+             "%lu,%.8f,%.8f,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.3f\n",
+             ms, lat, lon, sats, ax, ay, az, gx, gy, gz, temp, vel);
+
+    logFile.print(line);
+    logFile.flush();
 }
 
 // ────────────────────────────────────────────────
-// Check free space before writing (prevent flash full errors)
-bool check_littlefs_space() {
-    uint64_t used = LittleFS.usedBytes();
-    uint64_t total = LittleFS.totalBytes();
-    float percent = (float)used / total * 100.0f;
-
-    if (percent > 90.0f) {
-        log_info("WARNING: LittleFS almost full (%.1f%% used) – consider deleting old logs", percent);
-        return false;
-    }
-    return true;
-}
-
-// ────────────────────────────────────────────────
-// Rotate log file (size-based + free space check)
+// Rotate log file (size-based rotation)
 void rotate_log_file() {
     if (!logFile) {
         current_log_file = "/log_0.csv";
-        if (!check_littlefs_space()) {
-            log_info("Skipping log creation – flash almost full");
-            return;
-        }
         logFile = LittleFS.open(current_log_file, FILE_APPEND);
         if (logFile) {
             log_info("Created initial log: %s", current_log_file.c_str());
@@ -89,11 +87,6 @@ void rotate_log_file() {
     if (logFile.size() < 512 * 1024) return;
 
     logFile.close();
-
-    if (!check_littlefs_space()) {
-        log_info("Skipping rotation – flash almost full");
-        return;
-    }
 
     int index = 1;
     String new_file;
@@ -113,26 +106,31 @@ void rotate_log_file() {
 }
 
 // ────────────────────────────────────────────────
-// Log sensor & GPS data to CSV
+// Log data every 1 second
 void log_data() {
-    rotate_log_file();
+    if (millis() - last_log_ms < 1000) return;
+    last_log_ms = millis();
 
+    rotate_log_file();
     if (!logFile) return;
 
-    unsigned long ms = millis();
+    log_csv(millis(), lat, lon, satellites,
+            acc.x, acc.y, acc.z,
+            gyr.x, gyr.y, gyr.z,
+            temperature, velocity);
 
-    char line[256];
-    snprintf(line, sizeof(line),
-             "%lu,%.8f,%.8f,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.3f\n",
-             ms, lat, lon, satellites,
-             acc.x, acc.y, acc.z,
-             gyr.x, gyr.y, gyr.z,
-             temperature, velocity);
+    log_info("Logged (1s): pos=%.6f,%.6f | v=%.3f m/s", lat, lon, velocity);
+}
 
-    logFile.print(line);
-    logFile.flush();
+// ────────────────────────────────────────────────
+// Read MPU6500
+void read_mpu() {
+    acc = myIMU.getGValues();
+    gyr = myIMU.getGyrValues();
+    temperature = myIMU.getTemperature();
 
-    log_info("Logged: t=%lu | pos=%.6f,%.6f | v=%.3f m/s", ms, lat, lon, velocity);
+    log_info("MPU: ax=%.3f g, ay=%.3f g, az=%.3f g | gx=%.1f °/s, gy=%.1f °/s, gz=%.1f °/s | temp=%.1f °C",
+             acc.x, acc.y, acc.z, gyr.x, gyr.y, gyr.z, temperature);
 }
 
 // ────────────────────────────────────────────────
@@ -142,9 +140,9 @@ void handle_data() {
     snprintf(json, sizeof(json),
              "{\"timestamp\":%lu,"
              "\"lat\":%.8f,\"lon\":%.8f,\"sats\":%u,"
-             "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,"
-             "\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f,"
-             "\"temp\":%.2f,\"velocity\":%.3f}",
+             "\"accelX\":%.3f,\"accelY\":%.3f,\"accelZ\":%.3f,"
+             "\"gyroX\":%.3f,\"gyroY\":%.3f,\"gyroZ\":%.3f,"
+             "\"temperature\":%.2f,\"velocity\":%.3f}",
              millis(), lat, lon, satellites,
              acc.x, acc.y, acc.z,
              gyr.x, gyr.y, gyr.z,
@@ -154,16 +152,144 @@ void handle_data() {
 }
 
 // ────────────────────────────────────────────────
-// Root page
+// Professional Dashboard
 void handle_root() {
-    String html = "<!DOCTYPE html><html><head><title>ESP32 Tracker</title>"
-                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                  "<style>body{font-family:Arial;text-align:center;background:#f0f0f0;}"
-                  "h1{color:#333;}.data{font-size:1.4em;margin:20px;}</style></head>"
-                  "<body><h1>ESP32 Car Tracker</h1>"
-                  "<div class='data'>IP: " + WiFi.localIP().toString() + "</div>"
-                  "<div class='data'><a href='/data'>JSON API</a> | <a href='/files'>File Manager</a></div>"
-                  "<p>Check serial for logs</p></body></html>";
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ESP32 Car Tracker Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        body {font-family:'Segoe UI',Arial,sans-serif; background:#0f172a; color:#e2e8f0; margin:0; padding:20px;}
+        h1 {color:#60a5fa; text-align:center; margin-bottom:30px;}
+        .grid {display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px; max-width:1400px; margin:auto;}
+        .card {background:#1e2937; border-radius:12px; padding:20px; box-shadow:0 4px 15px rgba(0,0,0,0.3);}
+        .value {font-size:2.8em; font-weight:bold; margin:10px 0; color:#60a5fa;}
+        .label {font-size:1.1em; color:#94a3b8;}
+        canvas {max-height:280px;}
+        .gps {background:#1e2937; padding:20px; border-radius:12px; text-align:center;}
+        .gps-value {font-size:1.6em; color:#34d399;}
+        .temp-card {text-align:center;}
+        .temp-value {font-size:3.5em; font-weight:bold;}
+        .temp-hot {color:#ef4444;}
+        .temp-normal {color:#34d399;}
+        .temp-cold {color:#60a5fa;}
+        @media (max-width:900px) {.grid {grid-template-columns:1fr;}}
+    </style>
+</head>
+<body>
+    <h1>ESP32 Car Tracker – Live Dashboard</h1>
+    <div class="grid">
+        <div class="card">
+            <h2>Acceleration (g)</h2>
+            <canvas id="accelChart"></canvas>
+        </div>
+        <div class="card">
+            <h2>Gyroscope (°/s)</h2>
+            <canvas id="gyroChart"></canvas>
+        </div>
+        <div class="card">
+            <h2>Velocity (m/s)</h2>
+            <canvas id="velChart"></canvas>
+        </div>
+        <div class="card temp-card">
+            <h2>Temperature (°C)</h2>
+            <div id="tempValue" class="temp-value">--</div>
+            <div class="label">Board Temp</div>
+        </div>
+        <div class="card gps">
+            <h2>GPS Status</h2>
+            <div class="value" id="lat">0.000000</div>
+            <div class="label">Latitude</div>
+            <div class="value" id="lon">0.000000</div>
+            <div class="label">Longitude</div>
+            <div class="value" id="sats">0</div>
+            <div class="label">Satellites</div>
+            <div id="fix" style="margin-top:15px; font-size:1.4em;">NO FIX</div>
+        </div>
+    </div>
+
+    <script>
+        let accelChart, gyroChart, velChart;
+        let history = {ax:[],ay:[],az:[],gx:[],gy:[],gz:[],vel:[]};
+
+        function initCharts() {
+            const cfg = {type:'line', options:{animation:false, responsive:true, scales:{y:{beginAtZero:false}}}};
+            accelChart = new Chart(document.getElementById('accelChart'), {...cfg, data:{labels:[], datasets:[
+                {label:'X', borderColor:'#ef4444', data:[]},
+                {label:'Y', borderColor:'#22c55e', data:[]},
+                {label:'Z', borderColor:'#3b82f6', data:[]}
+            ]}});
+            gyroChart = new Chart(document.getElementById('gyroChart'), {...cfg, data:{labels:[], datasets:[
+                {label:'X', borderColor:'#ef4444', data:[]},
+                {label:'Y', borderColor:'#22c55e', data:[]},
+                {label:'Z', borderColor:'#3b82f6', data:[]}
+            ]}});
+            velChart = new Chart(document.getElementById('velChart'), {...cfg, data:{labels:[], datasets:[
+                {label:'Velocity', borderColor:'#eab308', data:[]}
+            ]}});
+        }
+
+        function updateDashboard() {
+            fetch('/data')
+                .then(r => r.json())
+                .then(d => {
+                    // Debug: log received data to browser console
+                    console.log("Received data:", d);
+
+                    // GPS
+                    document.getElementById('lat').textContent = d.lat.toFixed(6);
+                    document.getElementById('lon').textContent = d.lon.toFixed(6);
+                    document.getElementById('sats').textContent = d.sats;
+                    document.getElementById('fix').textContent = d.sats > 3 ? 'FIX ACQUIRED' : 'NO FIX';
+                    document.getElementById('fix').style.color = d.sats > 3 ? '#34d399' : '#f59e0b';
+
+                    // Temperature
+                    let tempEl = document.getElementById('tempValue');
+                    tempEl.textContent = d.temperature.toFixed(1);
+                    if (d.temperature > 45) tempEl.className = 'temp-value temp-hot';
+                    else if (d.temperature < 10) tempEl.className = 'temp-value temp-cold';
+                    else tempEl.className = 'temp-value temp-normal';
+
+                    // Charts
+                    let t = (d.timestamp/1000).toFixed(1);
+                    history.ax.push(d.accelX); history.ay.push(d.accelY); history.az.push(d.accelZ);
+                    history.gx.push(d.gyroX); history.gy.push(d.gyroY); history.gz.push(d.gyroZ);
+                    history.vel.push(d.velocity);
+
+                    if (history.ax.length > 60) {
+                        Object.keys(history).forEach(k => history[k].shift());
+                    }
+
+                    accelChart.data.labels = Array.from({length:history.ax.length}, (_,i)=> t - (history.ax.length-i)*1);
+                    accelChart.data.datasets[0].data = history.ax;
+                    accelChart.data.datasets[1].data = history.ay;
+                    accelChart.data.datasets[2].data = history.az;
+                    accelChart.update();
+
+                    gyroChart.data.labels = Array.from({length:history.gx.length}, (_,i)=> t - (history.gx.length-i)*1);
+                    gyroChart.data.datasets[0].data = history.gx;
+                    gyroChart.data.datasets[1].data = history.gy;
+                    gyroChart.data.datasets[2].data = history.gz;
+                    gyroChart.update();
+
+                    velChart.data.labels = Array.from({length:history.vel.length}, (_,i)=> t - (history.vel.length-i)*1);
+                    velChart.data.datasets[0].data = history.vel;
+                    velChart.update();
+                })
+                .catch(err => console.error("Dashboard fetch error:", err));
+        }
+
+        initCharts();
+        setInterval(updateDashboard, 1000);
+        updateDashboard();
+    </script>
+</body>
+</html>
+)rawliteral";
 
     server.send(200, "text/html", html);
 }
@@ -191,7 +317,7 @@ void handle_list() {
 }
 
 // ────────────────────────────────────────────────
-// Download log file (fix: accept with/without leading slash)
+// Download log file
 void handle_download() {
     if (!server.hasArg("file")) {
         server.send(400, "text/plain", "Missing file parameter");
@@ -199,13 +325,10 @@ void handle_download() {
     }
 
     String filename = server.arg("file");
-    // Normalize path (add leading / if missing)
-    if (!filename.startsWith("/")) {
-        filename = "/" + filename;
-    }
+    if (!filename.startsWith("/")) filename = "/" + filename;
 
     if (!LittleFS.exists(filename)) {
-        server.send(404, "text/plain", "File not found: " + filename);
+        server.send(404, "text/plain", "File not found");
         return;
     }
 
@@ -228,9 +351,7 @@ void handle_delete() {
     }
 
     String filename = server.arg("file");
-    if (!filename.startsWith("/")) {
-        filename = "/" + filename;
-    }
+    if (!filename.startsWith("/")) filename = "/" + filename;
 
     if (logFile && filename == current_log_file) {
         logFile.close();
@@ -370,6 +491,7 @@ void setup() {
     }
 
     last_update = millis();
+    last_log_ms = millis();
 }
 
 // ────────────────────────────────────────────────
@@ -395,7 +517,6 @@ void loop() {
     gyr = myIMU.getGyrValues();
     temperature = myIMU.getTemperature();
 
-    // Log MPU values every cycle
     log_info("MPU: ax=%.3f g, ay=%.3f g, az=%.3f g | gx=%.1f °/s, gy=%.1f °/s, gz=%.1f °/s | temp=%.1f °C",
              acc.x, acc.y, acc.z, gyr.x, gyr.y, gyr.z, temperature);
 
@@ -409,8 +530,8 @@ void loop() {
         velocity *= 0.98f;
     }
 
-    // Log everything
+    // Log every 1 second
     log_data();
 
-    delay(1000);
+    delay(250);  // keep loop responsive
 }
