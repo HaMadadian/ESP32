@@ -1,3 +1,7 @@
+#include "esp_sleep.h"
+#include "esp_timer.h"     // for esp_timer_get_time()
+
+
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -11,7 +15,7 @@ static const char *TAG = "DS1302";
 #define DS1302_IO    GPIO_NUM_5
 #define DS1302_SCLK  GPIO_NUM_6
 
-#define SET_TIME_NOW  1   // ← Change to 1 only when you want to force time set
+#define SET_TIME_NOW  0   // ← Change to 1 only when you want to force time set
 
 // BCD helpers
 static uint8_t bcd_to_dec(uint8_t bcd) {
@@ -65,10 +69,10 @@ typedef struct {
 
 // Global default time (used only when SET_TIME_NOW == 1 or RTC is corrupt)
 static const ds1302_time_t default_time = {
-    .sec   = 0x00,   // BCD already
-    .min   = 0x46,
-    .hour  = 0x22,
-    .day   = 0x12,
+    .sec   = 0x30,   // BCD already
+    .min   = 0x1,
+    .hour  = 0x23,
+    .day   = 0x13,
     .month = 0x04,
     .year  = 0x26
 };
@@ -148,28 +152,64 @@ static void ds1302_init(void)
 }
 
 
+static void print_wakeup_reason(void)
+{
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    switch (cause) {
+        case ESP_SLEEP_WAKEUP_TIMER: 
+            ESP_LOGI(TAG, "Woken up by TIMER"); 
+            break;
+        case ESP_SLEEP_WAKEUP_EXT0: 
+            ESP_LOGI(TAG, "Woken up by EXT0"); 
+            break;
+        case ESP_SLEEP_WAKEUP_EXT1: 
+            ESP_LOGI(TAG, "Woken up by EXT1"); 
+            break;
+        case ESP_SLEEP_WAKEUP_UNDEFINED:
+        default: 
+            ESP_LOGI(TAG, "Woken up by POWER-ON or RESET"); 
+            break;
+    }
+}
+
 
 void app_main(void)
-{   
-    vTaskDelay(pdMS_TO_TICKS(5000));
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));   // Stable boot delay
+
     ds1302_init();
 
-    #if SET_TIME_NOW
-        ds1302_set_time(&default_time);
-    #endif
+#if SET_TIME_NOW
+    ds1302_set_time(&default_time);
+#endif
+
+    print_wakeup_reason();   // ← Very useful in production
 
     while (1) {
         ds1302_time_t t;
-        ds1302_get_time(&t);           // validation happens inside
 
-        ESP_LOGI(TAG, "20%02d-%02d-%02d %02d:%02d:%02d",
-                 bcd_to_dec(t.year),
-                 bcd_to_dec(t.month),
-                 bcd_to_dec(t.day),
-                 bcd_to_dec(t.hour & 0x3F),
-                 bcd_to_dec(t.min),
-                 bcd_to_dec(t.sec));
+        for (int i = 0; i < 31; i++) {
+            if (i < 30) {
+                ds1302_get_time(&t);   // validation happens inside
+                ESP_LOGI(TAG, "20%02d-%02d-%02d %02d:%02d:%02d  |  Uptime: %lld ms",
+                        bcd_to_dec(t.year), bcd_to_dec(t.month), bcd_to_dec(t.day),
+                        bcd_to_dec(t.hour & 0x3F), bcd_to_dec(t.min), bcd_to_dec(t.sec),
+                        esp_timer_get_time() / 1000);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            } 
+            else {
+                ds1302_get_time(&t);
+                ESP_LOGI(TAG, "20%02d-%02d-%02d %02d:%02d:%02d  |  Uptime: %lld ms",
+                    bcd_to_dec(t.year), bcd_to_dec(t.month), bcd_to_dec(t.day),
+                    bcd_to_dec(t.hour & 0x3F), bcd_to_dec(t.min), bcd_to_dec(t.sec),
+                    esp_timer_get_time() / 1000);
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+                ESP_LOGI(TAG, "→ Going to Deep Sleep for 30 seconds...");
+
+            
+                esp_sleep_enable_timer_wakeup(30 * 1000000ULL);
+                esp_deep_sleep_start();
+            }
+        }
+    }        
 }
